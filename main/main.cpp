@@ -63,55 +63,99 @@ void init_spiffs() {
 //     }
 // }
 
-// Function to write sensor data to a CSV file
-void write_to_csv(float acc[3], float gyro[3]) {
+// // Function to write sensor data to a CSV file
+// void write_to_csv(float acc[3], float gyro[3]) {
 
 
-    struct stat st;
-    if (stat(FILE_PATH, &st) == 0) {
-    ESP_LOGI(TAG, "File exists! Size: %ld bytes", st.st_size);
-    } else {
-    ESP_LOGW(TAG, "File does not exist. Creating a new one...");
+//     struct stat st;
+//     if (stat(FILE_PATH, &st) == 0) {
+//     ESP_LOGI(TAG, "File exists! Size: %ld bytes", st.st_size);
+//     } else {
+//     ESP_LOGW(TAG, "File does not exist. Creating a new one...");
+//     }
+
+
+//     FILE *file = fopen(FILE_PATH, "a");
+//     if (file == NULL) {
+//         ESP_LOGE(TAG, "Failed to open file for writing");
+//         return;
+//     }
+
+//     // Get timestamp (millis since boot)
+//     uint32_t timestamp = esp_log_timestamp();
+
+//     // Default activity is "None"
+//     fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
+//             timestamp, acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]);
+
+//     fclose(file);
+//     ESP_LOGI(TAG, "Data written to CSV");
+// }
+
+// // Sensor Task: Reads accelerometer & gyroscope values and writes to CSV
+// void sensor_task(void *pvParameters) {
+//     while (1) {
+//         float acc[3], gyro[3];
+
+//         // Read sensor data
+//         QMI8658_read_xyz(acc, gyro, NULL);
+
+//         // Log data
+//         //ESP_LOGI(TAG, "Accelerometer (mg): X=%.2f Y=%.2f Z=%.2f", acc[0], acc[1], acc[2]);
+//         //ESP_LOGI(TAG, "Gyroscope (dps): X=%.2f Y=%.2f Z=%.2f", gyro[0], gyro[1], gyro[2]);
+
+//         // Write data to CSV
+//         write_to_csv(acc, gyro);
+
+//         // Delay (10ms) for 100Hz
+//         vTaskDelay(pdMS_TO_TICKS(10));
+//     }
+// }
+
+
+/**
+* New approach for file write
+*/
+
+FILE *filenew = NULL;
+
+void sensor_task(void *pvParameters) {
+    filenew = fopen(FILE_PATH, "a"); // Open once at task start
+    if (!filenew) {
+        ESP_LOGE(TAG, "Failed to open file");
+        vTaskDelete(NULL);
     }
+    float acc[3], gyro[3];
+    while (1) {
+        // Read sensor data
+        QMI8658_read_xyz(acc, gyro, NULL);
 
+        // Write data to CSV
+        fprintf(filenew, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
+                esp_log_timestamp(), acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]);
+        
+        // Flush periodically (every 10 samples)
+        static int count = 0;
+        if (++count >= 5) {
+            fflush(filenew);
+            count = 0;
+        }
 
+        vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz
+    }
+    fclose(filenew); // Close when task ends
+}
+
+//Initialize the csv file
+void csvColumn(){
     FILE *file = fopen(FILE_PATH, "a");
     if (file == NULL) {
         ESP_LOGE(TAG, "Failed to open file for writing");
         return;
     }
-
-    // Get timestamp (millis since boot)
-    uint32_t timestamp = esp_log_timestamp();
-
-    // Default activity is "None"
-    fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
-            timestamp, acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]);
-
+    fprintf(file, "timestamp,acc_X,acc_Y,acc_Z,gyro_X,gyro_Y,gyro_Z,activity \n");
     fclose(file);
-    ESP_LOGI(TAG, "Data written to CSV");
 }
-
-// Sensor Task: Reads accelerometer & gyroscope values and writes to CSV
-void sensor_task(void *pvParameters) {
-    while (1) {
-        float acc[3], gyro[3];
-
-        // Read sensor data
-        QMI8658_read_xyz(acc, gyro, NULL);
-
-        // Log data
-        //ESP_LOGI(TAG, "Accelerometer (mg): X=%.2f Y=%.2f Z=%.2f", acc[0], acc[1], acc[2]);
-        //ESP_LOGI(TAG, "Gyroscope (dps): X=%.2f Y=%.2f Z=%.2f", gyro[0], gyro[1], gyro[2]);
-
-        // Write data to CSV
-        write_to_csv(acc, gyro);
-
-        // Delay (100ms)
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
 
 /**
  * To download the csv file
@@ -335,10 +379,11 @@ extern "C" void app_main(void) {
 
     deleteFile();
 
-    FILE *file = fopen("/spiffs/sensor_data.csv", "r");
-    if (!file) {
-        ESP_LOGE("HTTP", "File not found!");
-    }
+    csvColumn();
+    // FILE *file = fopen("/spiffs/sensor_data.csv", "r");
+    // if (!file) {
+    //     ESP_LOGE("HTTP", "File not found!");
+    // }
 
     // Start HTTP Server
     start_http_server();
