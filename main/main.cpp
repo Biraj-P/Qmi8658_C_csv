@@ -141,7 +141,7 @@ void sensor_task(void *pvParameters) {
             count = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz
+        vTaskDelay(pdMS_TO_TICKS(40)); // 50Hz
     }
     fclose(filenew); // Close when task ends
 }
