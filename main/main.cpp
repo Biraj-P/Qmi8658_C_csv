@@ -113,37 +113,140 @@ void init_spiffs() {
 // }
 
 
+// /**
+// * New approach for file write
+// */
+
+// FILE *filenew = NULL;
+
+// void sensor_task(void *pvParameters) {
+//     filenew = fopen(FILE_PATH, "a"); // Open once at task start
+//     if (!filenew) {
+//         ESP_LOGE(TAG, "Failed to open file");
+//         vTaskDelete(NULL);
+//     }
+//     float acc[3], gyro[3];
+//     while (1) {
+//         // Read sensor data
+//         QMI8658_read_xyz(acc, gyro, NULL);
+
+//         // Write data to CSV
+//         fprintf(filenew, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
+//                 esp_log_timestamp(), acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]);
+        
+//         // Flush periodically (every 10 samples)
+//         static int count = 0;
+//         if (++count >= 5) {
+//             fflush(filenew);
+//             count = 0;
+//         }
+
+//         vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz
+//     }
+//     fclose(filenew); // Close when task ends
+// }
+
 /**
-* New approach for file write
-*/
+ * Producer- Consumer approach
+ */
 
-FILE *filenew = NULL;
+ #include "freertos/queue.h"
 
+ #define BUFFER_SIZE 100  // Store 100 samples (1 second of data at 100Hz)
+ #define FLUSH_THRESHOLD 50  // Flush when buffer has 50 samples
+ 
+ typedef struct {
+     uint32_t timestamp;
+     float acc[3];
+     float gyro[3];
+ } SensorData;
+ 
+ // Ring buffer and synchronization primitives
+ static SensorData buffer[BUFFER_SIZE];
+ static volatile uint16_t head = 0;  // Write index
+ static volatile uint16_t tail = 0;  // Read index
+ static SemaphoreHandle_t buffer_mutex;
+
+//My Produces function
 void sensor_task(void *pvParameters) {
-    filenew = fopen(FILE_PATH, "a"); // Open once at task start
-    if (!filenew) {
+    while (1) {
+        // Read sensor data
+        float acc[3], gyro[3];
+        QMI8658_read_xyz(acc, gyro, NULL);
+
+        // Acquire mutex before modifying buffer
+        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            // Add to buffer
+            buffer[head].timestamp = esp_log_timestamp();
+            memcpy(buffer[head].acc, acc, sizeof(acc));
+            memcpy(buffer[head].gyro, gyro, sizeof(gyro));
+
+            // Update head with wrap-around
+            head = (head + 1) % BUFFER_SIZE;
+
+            // Handle buffer overflow
+            if (head == tail) {
+                tail = (tail + 1) % BUFFER_SIZE;  // Discard oldest data
+                ESP_LOGW(TAG, "Buffer overflow!");
+            }
+
+            xSemaphoreGive(buffer_mutex);
+        }
+
+        // Strict 10ms delay for 100Hz
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+//My consumer function
+void writer_task(void *pvParameters) {
+    FILE *file = fopen(FILE_PATH, "a");
+    if (!file) {
         ESP_LOGE(TAG, "Failed to open file");
         vTaskDelete(NULL);
     }
-    float acc[3], gyro[3];
-    while (1) {
-        // Read sensor data
-        QMI8658_read_xyz(acc, gyro, NULL);
 
-        // Write data to CSV
-        fprintf(filenew, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
-                esp_log_timestamp(), acc[0], acc[1], acc[2], gyro[0], gyro[1], gyro[2]);
-        
-        // Flush periodically (every 10 samples)
-        static int count = 0;
-        if (++count >= 5) {
-            fflush(filenew);
-            count = 0;
+    while (1) {
+        // Wait for buffer to reach threshold or timeout (500ms)
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Acquire mutex and copy data
+        SensorData local_buffer[BUFFER_SIZE];
+        uint16_t num_to_write = 0;
+
+        if (xSemaphoreTake(buffer_mutex, portMAX_DELAY) == pdTRUE) {
+            // Calculate number of available samples
+            num_to_write = (head >= tail) ? (head - tail) : (BUFFER_SIZE - tail + head);
+
+            // Limit to maximum flush size
+            if (num_to_write > FLUSH_THRESHOLD) {
+                num_to_write = FLUSH_THRESHOLD;
+            }
+
+            // Copy data from ring buffer
+            for (int i = 0; i < num_to_write; i++) {
+                uint16_t idx = (tail + i) % BUFFER_SIZE;
+                memcpy(&local_buffer[i], &buffer[idx], sizeof(SensorData));
+            }
+
+            // Update tail (commit the read)
+            tail = (tail + num_to_write) % BUFFER_SIZE;
+
+            xSemaphoreGive(buffer_mutex);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(40)); // 50Hz
+        // Write to file (outside mutex to minimize blocking)
+        if (num_to_write > 0) {
+            for (int i = 0; i < num_to_write; i++) {
+                fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
+                        local_buffer[i].timestamp,
+                        local_buffer[i].acc[0], local_buffer[i].acc[1], local_buffer[i].acc[2],
+                        local_buffer[i].gyro[0], local_buffer[i].gyro[1], local_buffer[i].gyro[2]);
+            }
+            fflush(file);  // Ensure data is written to storage
+            ESP_LOGI(TAG, "Wrote %d samples to file", num_to_write);
+        }
     }
-    fclose(filenew); // Close when task ends
 }
 
 //Initialize the csv file
@@ -389,5 +492,12 @@ extern "C" void app_main(void) {
     start_http_server();
 
     // Create FreeRTOS task to read sensor data
-    xTaskCreate(sensor_task, "sensor_task", 8196, NULL, 5, NULL);
+    // xTaskCreate(sensor_task, "sensor_task", 8196, NULL, 5, NULL);
+    
+    // Initialize buffer synchronization
+    buffer_mutex = xSemaphoreCreateMutex();
+    
+    // Create tasks
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+    xTaskCreate(writer_task, "writer_task", 4096, NULL, 4, NULL);  // Lower priority
 }
