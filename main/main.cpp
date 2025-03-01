@@ -169,48 +169,55 @@ static volatile uint16_t head = 0;  // Write index
 static volatile uint16_t tail = 0;  // Read index
 static SemaphoreHandle_t buffer_mutex;
 
-// Producer Task: Reads sensor data at 50Hz and writes it to the buffer
-void sensor_task(void *pvParameters) {
+#define TEMP_BUFFER_SIZE 200   // 60ms write time so need to adjust acccordingly(min threshold)
 
+static SensorData temp_buffer[TEMP_BUFFER_SIZE];  // Temporary writer buffer
+static volatile uint8_t temp_index = 0;          // Write index for temp buffer
+
+void sensor_task(void *pvParameters) {
     float acc[3], gyro[3];
 
     while (1) {
-        //start timer
         int64_t start_time = esp_timer_get_time();
 
         // Read sensor data
         QMI8658_read_xyz(acc, gyro, NULL);
 
-        // Acquire mutex before modifying buffer
-        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            buffer[head].timestamp = esp_log_timestamp();
-            memcpy(buffer[head].acc, acc, sizeof(acc));
-            memcpy(buffer[head].gyro, gyro, sizeof(gyro));
+        // Store in temporary buffer first
+        temp_buffer[temp_index].timestamp = esp_log_timestamp();
+        memcpy(temp_buffer[temp_index].acc, acc, sizeof(acc));
+        memcpy(temp_buffer[temp_index].gyro, gyro, sizeof(gyro));
+        temp_index++;
 
-            // Update head with wrap-around
-            uint16_t next_head = (head + 1) % BUFFER_SIZE;
+        // Flush to ring buffer when temp buffer is full
+        if (temp_index >= TEMP_BUFFER_SIZE) {
+            if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                for (uint8_t i = 0; i < TEMP_BUFFER_SIZE; i++) {
+                    buffer[head] = temp_buffer[i];  // Copy data
+                    uint16_t next_head = (head + 1) % BUFFER_SIZE;
 
-            // Handle buffer overflow
-            if (next_head == tail) {
-                tail = (tail + 1) % BUFFER_SIZE;  // Discard oldest data
-                ESP_LOGW(TAG, "Buffer overflow!");
+                    // Handle overflow
+                    if (next_head == tail) {
+                        tail = (tail + 1) % BUFFER_SIZE;
+                        ESP_LOGW(TAG, "Buffer overflow!");
+                    }
+                    head = next_head;
+                }
+                xSemaphoreGive(buffer_mutex);
+                temp_index = 0;  // Reset temp buffer index
+            } else {
+                ESP_LOGW(TAG, "Failed to acquire mutex, temp buffer not flushed!");
             }
-
-            head = next_head;
-            xSemaphoreGive(buffer_mutex);
         }
 
         // Strict 20ms delay for 50Hz
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        //end timer
         int64_t end_time = esp_timer_get_time();
-        double time_taken = (double)(end_time - start_time) / 1000.0;
-        ESP_LOGI(TAG, "Time taken for sensor task is %f", time_taken);
+        ESP_LOGI(TAG, "Time taken for sensor task is %f ms", (double)(end_time - start_time) / 1000.0);
     }
 }
 
-// Consumer Task: Writes sensor data from buffer to file
 void writer_task(void *pvParameters) {
     FILE *file = fopen(FILE_PATH, "a");
     if (!file) {
@@ -226,15 +233,14 @@ void writer_task(void *pvParameters) {
     }
 
     while (1) {
-        //start timer
         int64_t start_time = esp_timer_get_time();
 
-        vTaskDelay(pdMS_TO_TICKS(500));  // Process data more frequently
+        vTaskDelay(pdMS_TO_TICKS(100));  // Process data periodically
 
         uint16_t num_to_write = 0;
 
-        // Quickly copy data and release mutex
-        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        // Acquire mutex only briefly for fast copy
+        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             num_to_write = (head >= tail) ? (head - tail) : (BUFFER_SIZE - tail + head);
             num_to_write = (num_to_write > FLUSH_THRESHOLD) ? FLUSH_THRESHOLD : num_to_write;
 
@@ -244,10 +250,10 @@ void writer_task(void *pvParameters) {
             }
 
             tail = (tail + num_to_write) % BUFFER_SIZE;  // Update tail
-            xSemaphoreGive(buffer_mutex);  //  Release the mutex IMMEDIATELY
+            xSemaphoreGive(buffer_mutex);  // Release mutex quickly
         }
 
-        // Write to file OUTSIDE of critical section
+        // Write to file outside critical section
         if (num_to_write > 0) {
             for (uint16_t i = 0; i < num_to_write; i++) {
                 fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
@@ -258,16 +264,16 @@ void writer_task(void *pvParameters) {
             fflush(file);
             ESP_LOGI(TAG, "Wrote %d samples to file", num_to_write);
         }
-        //end timer
+
         int64_t end_time = esp_timer_get_time();
-        double time_taken = (double)(end_time - start_time) / 1000.0;
-        ESP_LOGI(TAG, "Time taken for writer task is %f", time_taken);
+        ESP_LOGI(TAG, "Time taken for writer task is %f ms", (double)(end_time - start_time) / 1000.0);
     }
 
     free(local_buffer);
     fclose(file);
     vTaskDelete(NULL);
 }
+
 
 
 // /**
