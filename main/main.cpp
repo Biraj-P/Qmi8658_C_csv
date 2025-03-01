@@ -8,6 +8,8 @@
 #include "esp_vfs.h"
 #include "QMI8658.h"
 
+#include "queue.h"
+
 #define FILE_PATH "/spiffs/sensor_data.csv"
 
 // I2C Configuration
@@ -149,56 +151,66 @@ void init_spiffs() {
 /**
  * Producer- Consumer approach
  */
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
- #include "freertos/queue.h"
+#define BUFFER_SIZE 4096     // Store 100 samples (1 second of data at 100Hz)
+#define FLUSH_THRESHOLD 50    // Flush when buffer has 50 samples
 
- #define BUFFER_SIZE 100  // Store 100 samples (1 second of data at 100Hz)
- #define FLUSH_THRESHOLD 50  // Flush when buffer has 50 samples
- 
  typedef struct {
-     uint32_t timestamp;
-     float acc[3];
-     float gyro[3];
- } SensorData;
- 
- // Ring buffer and synchronization primitives
- static SensorData buffer[BUFFER_SIZE];
- static volatile uint16_t head = 0;  // Write index
- static volatile uint16_t tail = 0;  // Read index
- static SemaphoreHandle_t buffer_mutex;
+    uint32_t timestamp;
+    float acc[3];
+    float gyro[3];
+} SensorData;
 
-//My Produces function
+// Ring buffer and synchronization
+static SensorData buffer[BUFFER_SIZE];
+static volatile uint16_t head = 0;  // Write index
+static volatile uint16_t tail = 0;  // Read index
+static SemaphoreHandle_t buffer_mutex;
+
+// Producer Task: Reads sensor data at 50Hz and writes it to the buffer
 void sensor_task(void *pvParameters) {
+
+    float acc[3], gyro[3];
+
     while (1) {
+        //start timer
+        int64_t start_time = esp_timer_get_time();
+
         // Read sensor data
-        float acc[3], gyro[3];
         QMI8658_read_xyz(acc, gyro, NULL);
 
         // Acquire mutex before modifying buffer
-        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            // Add to buffer
+        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             buffer[head].timestamp = esp_log_timestamp();
             memcpy(buffer[head].acc, acc, sizeof(acc));
             memcpy(buffer[head].gyro, gyro, sizeof(gyro));
 
             // Update head with wrap-around
-            head = (head + 1) % BUFFER_SIZE;
+            uint16_t next_head = (head + 1) % BUFFER_SIZE;
 
             // Handle buffer overflow
-            if (head == tail) {
+            if (next_head == tail) {
                 tail = (tail + 1) % BUFFER_SIZE;  // Discard oldest data
                 ESP_LOGW(TAG, "Buffer overflow!");
             }
 
+            head = next_head;
             xSemaphoreGive(buffer_mutex);
         }
 
-        // Strict 10ms delay for 100Hz
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Strict 20ms delay for 50Hz
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        //end timer
+        int64_t end_time = esp_timer_get_time();
+        double time_taken = (double)(end_time - start_time) / 1000.0;
+        ESP_LOGI(TAG, "Time taken for sensor task is %f", time_taken);
     }
 }
 
-//My consumer function
+// Consumer Task: Writes sensor data from buffer to file
 void writer_task(void *pvParameters) {
     FILE *file = fopen(FILE_PATH, "a");
     if (!file) {
@@ -206,48 +218,136 @@ void writer_task(void *pvParameters) {
         vTaskDelete(NULL);
     }
 
-    while (1) {
-        // Wait for buffer to reach threshold or timeout (500ms)
-        vTaskDelay(pdMS_TO_TICKS(500));
+    SensorData *local_buffer = (SensorData *)malloc(FLUSH_THRESHOLD * sizeof(SensorData));
+    if (!local_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate memory");
+        fclose(file);
+        vTaskDelete(NULL);
+    }
 
-        // Acquire mutex and copy data
-        SensorData local_buffer[BUFFER_SIZE];
+    while (1) {
+        //start timer
+        int64_t start_time = esp_timer_get_time();
+
+        vTaskDelay(pdMS_TO_TICKS(500));  // Process data more frequently
+
         uint16_t num_to_write = 0;
 
-        if (xSemaphoreTake(buffer_mutex, portMAX_DELAY) == pdTRUE) {
-            // Calculate number of available samples
+        // Quickly copy data and release mutex
+        if (xSemaphoreTake(buffer_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             num_to_write = (head >= tail) ? (head - tail) : (BUFFER_SIZE - tail + head);
+            num_to_write = (num_to_write > FLUSH_THRESHOLD) ? FLUSH_THRESHOLD : num_to_write;
 
-            // Limit to maximum flush size
-            if (num_to_write > FLUSH_THRESHOLD) {
-                num_to_write = FLUSH_THRESHOLD;
-            }
-
-            // Copy data from ring buffer
-            for (int i = 0; i < num_to_write; i++) {
+            for (uint16_t i = 0; i < num_to_write; i++) {
                 uint16_t idx = (tail + i) % BUFFER_SIZE;
-                memcpy(&local_buffer[i], &buffer[idx], sizeof(SensorData));
+                local_buffer[i] = buffer[idx];  // Copy data
             }
 
-            // Update tail (commit the read)
-            tail = (tail + num_to_write) % BUFFER_SIZE;
-
-            xSemaphoreGive(buffer_mutex);
+            tail = (tail + num_to_write) % BUFFER_SIZE;  // Update tail
+            xSemaphoreGive(buffer_mutex);  //  Release the mutex IMMEDIATELY
         }
 
-        // Write to file (outside mutex to minimize blocking)
+        // Write to file OUTSIDE of critical section
         if (num_to_write > 0) {
-            for (int i = 0; i < num_to_write; i++) {
-                fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,None\n",
+            for (uint16_t i = 0; i < num_to_write; i++) {
+                fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
                         local_buffer[i].timestamp,
                         local_buffer[i].acc[0], local_buffer[i].acc[1], local_buffer[i].acc[2],
                         local_buffer[i].gyro[0], local_buffer[i].gyro[1], local_buffer[i].gyro[2]);
             }
-            fflush(file);  // Ensure data is written to storage
+            fflush(file);
             ESP_LOGI(TAG, "Wrote %d samples to file", num_to_write);
         }
+        //end timer
+        int64_t end_time = esp_timer_get_time();
+        double time_taken = (double)(end_time - start_time) / 1000.0;
+        ESP_LOGI(TAG, "Time taken for writer task is %f", time_taken);
     }
+
+    free(local_buffer);
+    fclose(file);
+    vTaskDelete(NULL);
 }
+
+
+// /**
+//  * FreeRTOS queue approach
+//  */
+
+ 
+//  #define QUEUE_SIZE 200  // Increase queue size to handle burst data
+//  #define BATCH_SIZE 50    // Write 50 samples at once to minimize delays
+ 
+//  typedef struct {
+//      uint32_t timestamp;
+//      float acc[3];
+//      float gyro[3];
+//  } SensorData;
+ 
+//  static QueueHandle_t sensor_queue;  // FreeRTOS queue
+ 
+//  // Producer Task (Sensor Data Collection)
+//  void sensor_task(void *pvParameters) {
+//      SensorData data;
+ 
+//      while (1) {
+//          // Read sensor data
+//          float acc[3], gyro[3];
+//          QMI8658_read_xyz(acc, gyro, NULL);
+ 
+//          data.timestamp = esp_log_timestamp();
+//          memcpy(data.acc, acc, sizeof(acc));
+//          memcpy(data.gyro, gyro, sizeof(gyro));
+ 
+//          // Try sending data to queue (non-blocking, to avoid blocking `sensor_task`)
+//          BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+//          if (xQueueSendFromISR(sensor_queue, &data, &xHigherPriorityTaskWoken) == errQUEUE_FULL) {
+//              ESP_LOGW(TAG, "Queue full, data lost!");
+//          }
+ 
+//          vTaskDelay(pdMS_TO_TICKS(20));  // Strict 50hz sampling
+//      }
+//  }
+ 
+//  // Consumer Task (Batch File Writing)
+//  void writer_task(void *pvParameters) {
+//      FILE *file = fopen(FILE_PATH, "a");
+//      if (!file) {
+//          ESP_LOGE(TAG, "Failed to open file");
+//          vTaskDelete(NULL);
+//      }
+ 
+//      SensorData local_buffer[BATCH_SIZE];
+ 
+//      while (1) {
+//          uint16_t num_to_write = 0;
+ 
+//          // Collect BATCH_SIZE samples
+//          while (num_to_write < BATCH_SIZE) {
+//              if (xQueueReceive(sensor_queue, &local_buffer[num_to_write], pdMS_TO_TICKS(5)) == pdTRUE) {
+//                  num_to_write++;
+//              } else {
+//                  break;  // Exit if no more data
+//              }
+//          }
+ 
+//          // Write batch to file (non-blocking)
+//          if (num_to_write > 0) {
+//              for (uint16_t i = 0; i < num_to_write; i++) {
+//                  fprintf(file, "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+//                          local_buffer[i].timestamp,
+//                          local_buffer[i].acc[0], local_buffer[i].acc[1], local_buffer[i].acc[2],
+//                          local_buffer[i].gyro[0], local_buffer[i].gyro[1], local_buffer[i].gyro[2]);
+//              }
+//              fflush(file);
+//              ESP_LOGI(TAG, "Wrote %d samples to file", num_to_write);
+//          }
+//      }
+ 
+//      fclose(file);
+//      vTaskDelete(NULL);
+//  }
+
 
 //Initialize the csv file
 void csvColumn(){
@@ -496,8 +596,22 @@ extern "C" void app_main(void) {
     
     // Initialize buffer synchronization
     buffer_mutex = xSemaphoreCreateMutex();
-    
+    if (!buffer_mutex) {
+        ESP_LOGE(TAG, "Failed to create buffer mutex");
+        return;
+    }
     // Create tasks
-    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
-    xTaskCreate(writer_task, "writer_task", 4096, NULL, 4, NULL);  // Lower priority
+    xTaskCreate(sensor_task, "Sensor Task", 4096, NULL, 10, NULL);
+    xTaskCreate(writer_task, "Writer Task", 8192, NULL, 5, NULL);
+
+    // // Create queue (200 sensor samples max)
+    // sensor_queue = xQueueCreate(QUEUE_SIZE, sizeof(SensorData));
+    // if (!sensor_queue) {
+    //     ESP_LOGE(TAG, "Failed to create queue");
+    //     return;
+    // }
+
+    // // Create tasks (Sensor on Core 1, Writer on Core 0)
+    // xTaskCreatePinnedToCore(sensor_task, "Sensor Task", 4096, NULL, 3, NULL, 1);  // LOW priority
+    // xTaskCreatePinnedToCore(writer_task, "Writer Task", 8192, NULL, 5, NULL, 0);  // HIGHOW priority
 }
