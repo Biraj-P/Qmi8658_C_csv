@@ -8,8 +8,6 @@
 #include "esp_vfs.h"
 #include "QMI8658.h"
 
-#include "queue.h"
-
 #define FILE_PATH "/spiffs/sensor_data.csv"
 
 // I2C Configuration
